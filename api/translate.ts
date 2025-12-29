@@ -1,5 +1,18 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
+/**
+ * Serverless API Endpoint: POST /api/translate
+ *
+ * Deploy to Vercel with OPENAI_API_KEY environment variable.
+ *
+ * Request: POST with JSON body { "text": "string", "deviceId": "string" }
+ * Response: { "output": TranslationResult } or { "error": "string", "code": "string" }
+ */
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
 interface TranslationResult {
   detectedGeneration: string;
   originalText: string;
@@ -15,6 +28,10 @@ interface TranslateRequest {
   deviceId?: string;
 }
 
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
 const CONFIG = {
   KILL_SWITCH_ENABLED: false,
   MAX_CHARACTERS: 80,
@@ -22,12 +39,19 @@ const CONFIG = {
   RATE_LIMIT_REQUESTS: 10,
   RATE_LIMIT_WINDOW_MS: 60 * 60 * 1000,
   CACHE_TTL_MS: 24 * 60 * 60 * 1000,
-  // Keep this high enough for 6 generations + slangWords; 900–1200 is reasonable.
-  MAX_OUTPUT_TOKENS: 1100,
+  MAX_OUTPUT_TOKENS: 800,
 };
+
+// ============================================================================
+// IN-MEMORY STORES (Note: resets on cold start - use Redis in production)
+// ============================================================================
 
 const rateLimitStore: Map<string, { count: number; windowStart: number }> = new Map();
 const cacheStore: Map<string, { result: TranslationResult; timestamp: number; normalizedText: string }> = new Map();
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
 function normalizeText(text: string): string {
   return text.toLowerCase().trim().replace(/\s+/g, " ");
@@ -38,8 +62,8 @@ function getCacheKey(text: string): string {
   let hash = 0;
   for (let i = 0; i < normalized.length; i++) {
     const char = normalized.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash |= 0;
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
   }
   return `cache_${Math.abs(hash)}`;
 }
@@ -50,17 +74,11 @@ function validateInput(text: string): { valid: boolean; error?: { error: string;
   }
   const trimmed = text.trim();
   if (trimmed.length > CONFIG.MAX_CHARACTERS) {
-    return {
-      valid: false,
-      error: { error: `Text is too long. Please keep it under ${CONFIG.MAX_CHARACTERS} characters.`, code: "INPUT_TOO_LONG" },
-    };
+    return { valid: false, error: { error: `Text is too long. Please keep it under ${CONFIG.MAX_CHARACTERS} characters.`, code: "INPUT_TOO_LONG" } };
   }
-  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  const wordCount = trimmed.split(/\s+/).filter(w => w.length > 0).length;
   if (wordCount > CONFIG.MAX_WORDS) {
-    return {
-      valid: false,
-      error: { error: `Too many words. Please keep it under ${CONFIG.MAX_WORDS} words.`, code: "TOO_MANY_WORDS" },
-    };
+    return { valid: false, error: { error: `Too many words. Please keep it under ${CONFIG.MAX_WORDS} words.`, code: "TOO_MANY_WORDS" } };
   }
   return { valid: true };
 }
@@ -109,75 +127,83 @@ function saveToCache(text: string, result: TranslationResult): void {
   cacheStore.set(cacheKey, { result, timestamp: Date.now(), normalizedText: normalizeText(text) });
 }
 
-function parseBody(req: VercelRequest): TranslateRequest {
-  // Vercel sometimes provides body as a string
-  if (typeof req.body === "string") return JSON.parse(req.body);
-  return (req.body ?? {}) as TranslateRequest;
-}
+// ============================================================================
+// SYSTEM PROMPT
+// ============================================================================
 
-// NOTE: This prompt is intentionally strict and shorter to reduce truncation risk.
-const SYSTEM_PROMPT = `Return ONLY valid JSON matching this schema exactly. No markdown. No extra text.
+const SYSTEM_PROMPT = `You are a comprehensive slang translation expert. Analyze the input text and:
+1. Detect which generation's slang it uses (Classic, Baby Boomers, Gen X, Millennials, Gen Z, Gen Alpha, or Standard English)
+2. Translate it to ALL other generations' slang styles
+3. For each translation, identify the slang words used and provide their definitions
 
-Schema:
+Generation definitions:
+- Classic: 1950s - 1970s era slang
+- Baby Boomers: Born 1946 - 1964
+- Gen X: Born 1965 - 1980
+- Millennials: Born 1981 - 1996
+- Gen Z: Born 1997 - 2009
+- Gen Alpha: Born 2010 - Current
+
+Return ONLY a valid JSON object with this exact structure:
 {
   "detectedGeneration": "Classic" | "Baby Boomers" | "Gen X" | "Millennials" | "Gen Z" | "Gen Alpha" | "Standard English",
-  "originalText": string,
+  "originalText": "the input text",
   "translations": [
     {
       "generation": "Classic" | "Baby Boomers" | "Gen X" | "Millennials" | "Gen Z" | "Gen Alpha",
-      "text": string,
-      "slangWords": [{"word": string, "definition": string}]
+      "text": "translated text",
+      "slangWords": [
+        {"word": "slang word", "definition": "what it means"}
+      ]
     }
   ]
 }
 
-Rules:
-- Include ALL 6 generations in translations (Classic, Baby Boomers, Gen X, Millennials, Gen Z, Gen Alpha).
-- slangWords must include ONLY the slang terms you used in that translation; may be empty [].
-- Keep translations accurate and natural; do not invent definitions that are obviously wrong.
-- Ensure the JSON is complete and parseable.`;
+Include translations for all 6 generations. Be creative with generation-specific slang but keep translations accurate and natural.`;
 
-// Simple structure validation so the app never receives “incomplete” output silently.
-function isValidResult(x: any): x is TranslationResult {
-  if (!x || typeof x !== "object") return false;
-  if (typeof x.detectedGeneration !== "string") return false;
-  if (typeof x.originalText !== "string") return false;
-  if (!Array.isArray(x.translations) || x.translations.length !== 6) return false;
-
-  for (const t of x.translations) {
-    if (!t || typeof t !== "object") return false;
-    if (typeof t.generation !== "string") return false;
-    if (typeof t.text !== "string") return false;
-    if (!Array.isArray(t.slangWords)) return false;
-    for (const sw of t.slangWords) {
-      if (!sw || typeof sw.word !== "string" || typeof sw.definition !== "string") return false;
-    }
-  }
-  return true;
-}
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" });
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  // Only allow POST
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" });
+  }
 
   try {
+    // 1. Check kill switch
     if (CONFIG.KILL_SWITCH_ENABLED) {
       return res.status(503).json({ error: "Translation service is temporarily unavailable.", code: "SERVICE_DISABLED" });
     }
 
-    const body = parseBody(req);
+    // 2. Parse request body
+    const body: TranslateRequest = req.body;
     const { text, deviceId } = body;
 
+    // 3. Validate input
     const validation = validateInput(text);
-    if (!validation.valid) return res.status(400).json(validation.error);
+    if (!validation.valid) {
+      return res.status(400).json(validation.error);
+    }
 
+    // 4. Check cache first
     const cachedResult = getFromCache(text);
-    if (cachedResult) return res.status(200).json({ output: cachedResult, cached: true });
+    if (cachedResult) {
+      return res.status(200).json({ output: cachedResult, cached: true });
+    }
 
+    // 5. Check rate limit
     const rateLimitResult = checkRateLimit(deviceId || "anonymous");
     if (!rateLimitResult.allowed) {
       const minutes = Math.ceil((rateLimitResult.retryAfter || 0) / 60);
@@ -188,22 +214,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // 6. Get API key from environment
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       console.error("OPENAI_API_KEY not configured");
       return res.status(500).json({ error: "Translation service is not configured.", code: "SERVER_ERROR" });
     }
 
+    // 7. Call OpenAI API
     const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4o-2024-11-20",
         max_tokens: CONFIG.MAX_OUTPUT_TOKENS,
-        temperature: 0.4,
+        temperature: 0.8,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: text.trim() },
@@ -211,57 +239,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }),
     });
 
-    const rawText = await openaiResponse.text();
-
     if (!openaiResponse.ok) {
-      console.error("OpenAI API Error:", openaiResponse.status, rawText);
+      const errorData = await openaiResponse.json().catch(() => ({}));
+      console.error("OpenAI API Error:", openaiResponse.status, errorData);
+
       if (openaiResponse.status === 429) {
         return res.status(429).json({ error: "Service is busy. Please try again.", code: "RATE_LIMITED", retryAfter: 30 });
       }
       return res.status(500).json({ error: "Translation failed. Please try again.", code: "SERVER_ERROR" });
     }
 
-    // Parse OpenAI JSON envelope first
-    let envelope: any;
-    try {
-      envelope = JSON.parse(rawText);
-    } catch {
-      console.error("OpenAI returned non-JSON envelope:", rawText.slice(0, 500));
+    const data = await openaiResponse.json();
+    const resultText = data.choices?.[0]?.message?.content?.trim() || "";
+
+    // 8. Parse JSON response
+    const jsonMatch = resultText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.error("Could not parse OpenAI response:", resultText);
       return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
     }
 
-    const resultText: string = envelope?.choices?.[0]?.message?.content?.trim?.() ?? "";
-    if (!resultText) {
-      console.error("Empty content from OpenAI:", JSON.stringify(envelope).slice(0, 800));
-      return res.status(500).json({ error: "Translation response was incomplete.", code: "INCOMPLETE_RESPONSE" });
-    }
-
-    // Now parse the model-produced JSON
     let result: TranslationResult;
     try {
-      result = JSON.parse(resultText);
+      result = JSON.parse(jsonMatch[0]);
     } catch {
-      // Last-resort: try to extract the JSON object if model leaked text (rare with strict prompt)
-      const jsonMatch = resultText.match(/\{[\s\S]*\}\s*$/);
-      if (!jsonMatch) {
-        console.error("Could not parse model JSON:", resultText.slice(0, 500));
-        return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
-      }
-      try {
-        result = JSON.parse(jsonMatch[0]);
-      } catch {
-        console.error("Model JSON parse error:", jsonMatch[0].slice(0, 500));
-        return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
-      }
+      console.error("JSON parse error:", jsonMatch[0]);
+      return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
     }
 
-    if (!isValidResult(result)) {
-      console.error("Result structure invalid/incomplete:", JSON.stringify(result).slice(0, 800));
-      return res.status(500).json({ error: "Translation response was incomplete.", code: "INCOMPLETE_RESPONSE" });
-    }
-
+    // 9. Save to cache
     saveToCache(text, result);
+
+    // 10. Return success
     return res.status(200).json({ output: result });
+
   } catch (error) {
     console.error("Unexpected error:", error);
     return res.status(500).json({ error: "Something went wrong.", code: "SERVER_ERROR" });
