@@ -1,280 +1,260 @@
+// api/translate.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-/**
- * Serverless API Endpoint: POST /api/translate
- *
- * Deploy to Vercel with OPENAI_API_KEY environment variable.
- *
- * Request: POST with JSON body { "text": "string", "deviceId": "string" }
- * Response: { "output": TranslationResult } or { "error": "string", "code": "string" }
- */
+type TranslateMode = "plain" | "professional" | "parent";
 
-// ============================================================================
-// TYPES
-// ============================================================================
-
-interface TranslationResult {
-  detectedGeneration: string;
-  originalText: string;
-  translations: Array<{
-    generation: string;
-    text: string;
-    slangWords: Array<{ word: string; definition: string }>;
-  }>;
-}
-
-interface TranslateRequest {
+type TranslateRequest = {
   text: string;
   deviceId?: string;
-}
-
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-const CONFIG = {
-  KILL_SWITCH_ENABLED: false,
-  MAX_CHARACTERS: 80,
-  MAX_WORDS: 20,
-  RATE_LIMIT_REQUESTS: 10,
-  RATE_LIMIT_WINDOW_MS: 60 * 60 * 1000,
-  CACHE_TTL_MS: 24 * 60 * 60 * 1000,
-  MAX_OUTPUT_TOKENS: 800,
+  mode?: TranslateMode;
 };
 
-// ============================================================================
-// IN-MEMORY STORES (Note: resets on cold start - use Redis in production)
-// ============================================================================
+type TranslateSuccess = {
+  output: string;
+  cached?: boolean;
+};
 
-const rateLimitStore: Map<string, { count: number; windowStart: number }> = new Map();
-const cacheStore: Map<string, { result: TranslationResult; timestamp: number; normalizedText: string }> = new Map();
+type TranslateError = {
+  error: string;
+  code:
+    | "METHOD_NOT_ALLOWED"
+    | "VALIDATION_ERROR"
+    | "RATE_LIMIT"
+    | "KILL_SWITCH"
+    | "MISSING_API_KEY"
+    | "UPSTREAM_ERROR"
+    | "INTERNAL_ERROR";
+  retryAfterSeconds?: number;
+  upstreamStatus?: number;
+  details?: string; // safe diagnostic (no secrets)
+};
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
+// -------------------- Config --------------------
+const MAX_CHARS = 80;
+const MAX_WORDS = 20;
+const MAX_OUTPUT_TOKENS = 60;
 
-function normalizeText(text: string): string {
-  return text.toLowerCase().trim().replace(/\s+/g, " ");
+// Serverless note: in-memory state is best-effort (may reset between invocations)
+const RATE_LIMIT_MAX_PER_HOUR = 10;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+// If you want to be extra safe on availability, use gpt-4o-mini.
+const OPENAI_MODEL = "gpt-4o-mini";
+
+// Optional kill switch: set DISABLE_TRANSLATION="true" in Vercel env vars to hard stop.
+const KILL_SWITCH_ENV = process.env.DISABLE_TRANSLATION === "true";
+
+// -------------------- Best-effort in-memory stores --------------------
+const rateLimitByKey = new Map<
+  string,
+  { count: number; windowStartMs: number }
+>();
+const cache = new Map<string, { output: string; createdMs: number }>();
+
+// -------------------- Helpers --------------------
+function normalizeText(s: string): string {
+  return s.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function getCacheKey(text: string): string {
-  const normalized = normalizeText(text);
-  let hash = 0;
-  for (let i = 0; i < normalized.length; i++) {
-    const char = normalized.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return `cache_${Math.abs(hash)}`;
+function countWords(s: string): number {
+  const t = s.trim();
+  if (!t) return 0;
+  return t.split(/\s+/).filter(Boolean).length;
 }
 
-function validateInput(text: string): { valid: boolean; error?: { error: string; code: string } } {
-  if (!text || typeof text !== "string" || text.trim().length === 0) {
-    return { valid: false, error: { error: "Please enter some text to translate.", code: "INVALID_INPUT" } };
-  }
-  const trimmed = text.trim();
-  if (trimmed.length > CONFIG.MAX_CHARACTERS) {
-    return { valid: false, error: { error: `Text is too long. Please keep it under ${CONFIG.MAX_CHARACTERS} characters.`, code: "INPUT_TOO_LONG" } };
-  }
-  const wordCount = trimmed.split(/\s+/).filter(w => w.length > 0).length;
-  if (wordCount > CONFIG.MAX_WORDS) {
-    return { valid: false, error: { error: `Too many words. Please keep it under ${CONFIG.MAX_WORDS} words.`, code: "TOO_MANY_WORDS" } };
-  }
-  return { valid: true };
+function validateInput(text: string): string | null {
+  if (!text || !text.trim()) return "Please enter text to translate.";
+  if (text.length > MAX_CHARS)
+    return `Please keep it under ${MAX_CHARS} characters.`;
+  const words = countWords(text);
+  if (words > MAX_WORDS) return `Please keep it under ${MAX_WORDS} words.`;
+  return null;
 }
 
-function checkRateLimit(deviceId: string): { allowed: boolean; retryAfter?: number } {
+function getClientKey(req: VercelRequest, deviceId?: string): string {
+  // Prefer deviceId if provided; else fallback to IP.
+  const ip =
+    (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim() ||
+    (req.socket?.remoteAddress ?? "unknown");
+  return deviceId?.trim() ? `device:${deviceId.trim()}` : `ip:${ip}`;
+}
+
+function checkRateLimit(key: string): { ok: true } | { ok: false; retryAfterSeconds: number } {
   const now = Date.now();
-  const key = deviceId || "anonymous";
-  const data = rateLimitStore.get(key);
+  const windowMs = 60 * 60 * 1000;
 
-  if (!data || now - data.windowStart > CONFIG.RATE_LIMIT_WINDOW_MS) {
-    rateLimitStore.set(key, { count: 1, windowStart: now });
-    return { allowed: true };
+  const entry = rateLimitByKey.get(key);
+  if (!entry || now - entry.windowStartMs >= windowMs) {
+    rateLimitByKey.set(key, { count: 1, windowStartMs: now });
+    return { ok: true };
   }
 
-  if (data.count >= CONFIG.RATE_LIMIT_REQUESTS) {
-    const timeUntilReset = Math.ceil((data.windowStart + CONFIG.RATE_LIMIT_WINDOW_MS - now) / 1000);
-    return { allowed: false, retryAfter: Math.max(0, timeUntilReset) };
+  if (entry.count >= RATE_LIMIT_MAX_PER_HOUR) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((windowMs - (now - entry.windowStartMs)) / 1000)
+    );
+    return { ok: false, retryAfterSeconds };
   }
 
-  data.count++;
-  rateLimitStore.set(key, data);
-  return { allowed: true };
+  entry.count += 1;
+  rateLimitByKey.set(key, entry);
+  return { ok: true };
 }
 
-function getFromCache(text: string): TranslationResult | null {
-  const cacheKey = getCacheKey(text);
-  const entry = cacheStore.get(cacheKey);
-  if (!entry) return null;
-
-  const now = Date.now();
-  if (now - entry.timestamp > CONFIG.CACHE_TTL_MS) {
-    cacheStore.delete(cacheKey);
-    return null;
-  }
-  if (entry.normalizedText !== normalizeText(text)) return null;
-  return entry.result;
+function readJsonBody(req: VercelRequest): TranslateRequest {
+  // Vercel can provide req.body as object OR string.
+  const raw = req.body as unknown;
+  if (typeof raw === "string") return JSON.parse(raw) as TranslateRequest;
+  return raw as TranslateRequest;
 }
 
-function saveToCache(text: string, result: TranslationResult): void {
-  const cacheKey = getCacheKey(text);
-  if (cacheStore.size > 100) {
-    const entries = Array.from(cacheStore.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    entries.slice(0, 50).forEach(([key]) => cacheStore.delete(key));
-  }
-  cacheStore.set(cacheKey, { result, timestamp: Date.now(), normalizedText: normalizeText(text) });
-}
-
-// ============================================================================
-// SYSTEM PROMPT
-// ============================================================================
-
-const SYSTEM_PROMPT = `You are a comprehensive slang translation expert. Analyze the input text and:
-1. Detect which generation's slang it uses (Classic, Baby Boomers, Gen X, Millennials, Gen Z, Gen Alpha, or Standard English)
-2. Translate it to ALL other generations' slang styles
-3. For each translation, identify the slang words used and provide their definitions
-
-Generation definitions:
-- Classic: 1950s - 1970s era slang (groovy, hip, cool cat, daddy-o, far out)
-- Baby Boomers: Born 1946 - 1964 (right on, bummer, boogie, peace out)
-- Gen X: Born 1965 - 1980 (rad, gnarly, totally, psych, as if, whatever)
-- Millennials: Born 1981 - 1996 (GOAT, slay, iconic, adulting, ghosting, basic)
-- Gen Z: Born 1997 - 2009 (no cap, bussin, glazing, based, mid, ratio, delulu, aura)
-- Gen Alpha: Born 2010 - Current (skibidi, gyatt, rizz, ohio, sigma, mewing, fanum tax)
-
-Return ONLY a valid JSON object with this exact structure:
-{
-  "detectedGeneration": "Classic" | "Baby Boomers" | "Gen X" | "Millennials" | "Gen Z" | "Gen Alpha" | "Standard English",
-  "originalText": "the input text",
-  "translations": [
-    {
-      "generation": "Classic" | "Baby Boomers" | "Gen X" | "Millennials" | "Gen Z" | "Gen Alpha",
-      "text": "translated text",
-      "slangWords": [
-        {"word": "slang word", "definition": "what it means"}
-      ]
-    }
-  ]
-}
-
-Include translations for all 6 generations. Be creative with generation-specific slang but keep translations accurate and natural.`;
-
-// ============================================================================
-// MAIN HANDLER
-// ============================================================================
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS headers
+function send(res: VercelResponse, status: number, payload: TranslateSuccess | TranslateError) {
+  res.setHeader("Content-Type", "application/json");
+  // Optional: allow your app to call cross-origin if needed
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  return res.status(status).json(payload);
+}
 
-  // Handle preflight
+// -------------------- Handler --------------------
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // CORS preflight
   if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     return res.status(204).end();
   }
 
-  // Only allow POST
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" });
+    return send(res, 405, {
+      error: "Method not allowed",
+      code: "METHOD_NOT_ALLOWED",
+    });
   }
 
   try {
-    // 1. Check kill switch
-    if (CONFIG.KILL_SWITCH_ENABLED) {
-      return res.status(503).json({ error: "Translation service is temporarily unavailable.", code: "SERVICE_DISABLED" });
-    }
-
-    // 2. Parse request body
-    const body: TranslateRequest = req.body;
-    const { text, deviceId } = body;
-
-    // 3. Validate input
-    const validation = validateInput(text);
-    if (!validation.valid) {
-      return res.status(400).json(validation.error);
-    }
-
-    // 4. Check cache first
-    const cachedResult = getFromCache(text);
-    if (cachedResult) {
-      return res.status(200).json({ output: cachedResult, cached: true });
-    }
-
-    // 5. Check rate limit
-    const rateLimitResult = checkRateLimit(deviceId || "anonymous");
-    if (!rateLimitResult.allowed) {
-      const minutes = Math.ceil((rateLimitResult.retryAfter || 0) / 60);
-      return res.status(429).json({
-        error: `Too many requests. Please wait ${minutes} minute${minutes !== 1 ? "s" : ""}.`,
-        code: "RATE_LIMITED",
-        retryAfter: rateLimitResult.retryAfter,
+    if (KILL_SWITCH_ENV) {
+      return send(res, 503, {
+        error: "Translation service is temporarily disabled.",
+        code: "KILL_SWITCH",
       });
     }
 
-    // 6. Get API key from environment
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      console.error("OPENAI_API_KEY not configured");
-      return res.status(500).json({ error: "Translation service is not configured.", code: "SERVER_ERROR" });
+      return send(res, 500, {
+        error: "Server is missing OpenAI API key configuration.",
+        code: "MISSING_API_KEY",
+      });
     }
 
-    // 7. Call OpenAI API
-    const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+    // Parse and validate body
+    let body: TranslateRequest;
+    try {
+      body = readJsonBody(req);
+    } catch (e: any) {
+      return send(res, 400, {
+        error: "Invalid JSON body.",
+        code: "VALIDATION_ERROR",
+        details: e?.message ?? "Body parse failed",
+      });
+    }
+
+    const text = body?.text ?? "";
+    const mode: TranslateMode = body?.mode ?? "plain";
+    const deviceId = body?.deviceId;
+
+    const validationError = validateInput(text);
+    if (validationError) {
+      return send(res, 400, {
+        error: validationError,
+        code: "VALIDATION_ERROR",
+      });
+    }
+
+    // Rate limit
+    const clientKey = getClientKey(req, deviceId);
+    const rl = checkRateLimit(clientKey);
+    if (!rl.ok) {
+      res.setHeader("Retry-After", String(rl.retryAfterSeconds));
+      return send(res, 429, {
+        error: "Too many requests. Please try again later.",
+        code: "RATE_LIMIT",
+        retryAfterSeconds: rl.retryAfterSeconds,
+      });
+    }
+
+    // Cache
+    const cacheKey = `${mode}:${normalizeText(text)}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.createdMs < CACHE_TTL_MS) {
+      return send(res, 200, { output: cached.output, cached: true });
+    }
+
+    // Build instruction (you asked to remove the earlier “You are Slangify…” prompt,
+    // so this is a neutral, short instruction.)
+    const systemByMode: Record<TranslateMode, string> = {
+      plain: "Rewrite the text into clear, easy-to-understand English while preserving meaning and tone. Be concise.",
+      professional: "Rewrite the text into clear, professional English while preserving meaning and tone. Be concise.",
+      parent: "Rewrite the text into clear, family-friendly English while preserving meaning and tone. Be concise.",
+    };
+
+    // Call OpenAI (Chat Completions)
+    const openaiResponse = await fetch(OPENAI_API_URL, {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-2024-11-20",
-        max_tokens: CONFIG.MAX_OUTPUT_TOKENS,
-        temperature: 0.8,
+        model: OPENAI_MODEL,
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: text.trim() },
+          { role: "system", content: systemByMode[mode] ?? systemByMode.plain },
+          { role: "user", content: text },
         ],
+        max_tokens: MAX_OUTPUT_TOKENS,
+        temperature: 0.2,
       }),
     });
 
     if (!openaiResponse.ok) {
-      const errorData = await openaiResponse.json().catch(() => ({}));
-      console.error("OpenAI API Error:", openaiResponse.status, errorData);
+      const errText = await openaiResponse.text().catch(() => "");
+      console.error("OpenAI error:", openaiResponse.status, errText);
 
-      if (openaiResponse.status === 429) {
-        return res.status(429).json({ error: "Service is busy. Please try again.", code: "RATE_LIMITED", retryAfter: 30 });
-      }
-      return res.status(500).json({ error: "Translation failed. Please try again.", code: "SERVER_ERROR" });
+      return send(res, 502, {
+        error: "Translation failed. Please try again.",
+        code: "UPSTREAM_ERROR",
+        upstreamStatus: openaiResponse.status,
+        details: errText?.slice(0, 400) || "No upstream details",
+      });
     }
 
-    const data = await openaiResponse.json();
-    const resultText = data.choices?.[0]?.message?.content?.trim() || "";
+    const data = (await openaiResponse.json()) as any;
+    const output: string | undefined = data?.choices?.[0]?.message?.content;
 
-    // 8. Parse JSON response
-    const jsonMatch = resultText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error("Could not parse OpenAI response:", resultText);
-      return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
+    if (!output || typeof output !== "string") {
+      console.error("Unexpected OpenAI response shape:", JSON.stringify(data)?.slice(0, 800));
+      return send(res, 500, {
+        error: "Unexpected response from translation provider.",
+        code: "INTERNAL_ERROR",
+      });
     }
 
-    let result: TranslationResult;
-    try {
-      result = JSON.parse(jsonMatch[0]);
-    } catch {
-      console.error("JSON parse error:", jsonMatch[0]);
-      return res.status(500).json({ error: "Could not parse translation.", code: "PARSE_ERROR" });
-    }
+    const finalText = output.trim();
 
-    // 9. Save to cache
-    saveToCache(text, result);
+    cache.set(cacheKey, { output: finalText, createdMs: Date.now() });
 
-    // 10. Return success
-    return res.status(200).json({ output: result });
-
-  } catch (error) {
-    console.error("Unexpected error:", error);
-    return res.status(500).json({ error: "Something went wrong.", code: "SERVER_ERROR" });
+    return send(res, 200, { output: finalText, cached: false });
+  } catch (err: any) {
+    console.error("Unhandled translate error:", err);
+    return send(res, 500, {
+      error: "Something went wrong. Please try again.",
+      code: "INTERNAL_ERROR",
+      details: err?.message ?? "Unknown error",
+    });
   }
 }
